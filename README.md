@@ -4,7 +4,7 @@ A lightweight utility batch file for Windows that lets you to center the active 
 
 ## Features
 
-- Customizable primary and secondary hotkeys (supports `Ctrl`, `Shift`, `Alt` combinations)
+- Customizable primary and secondary hotkeys (supports `Ctrl`, `Shift`, `Alt`, `FN` combinations)
 - Live hotkey recording via the settings window
 - Two centering modes: respect taskbar bounds or ignore it
 - System tray icon with context menu (pause, settings, exit)
