@@ -3,6 +3,8 @@ setlocal EnableExtensions DisableDelayedExpansion
 set "POWERSHELL=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 if not exist "%POWERSHELL%" (echo PowerShell not found.& pause & exit /b 1)
 set "me=%~f0"
+set "CENTER_WINDOW_BATDIR=%~dp0"
+set "CENTER_WINDOW_BATFILE=%me%"
 set "tempPs=%TEMP%\CenterWindowTray.ps1"
 set "tempVbs=%TEMP%\CenterWindowTray.vbs"
 for /f "tokens=1 delims=:" %%N in ('findstr /n "^:PS_START" "%me%"') do set "startLine=%%N"
@@ -24,6 +26,8 @@ exit /b
 :PS_START
 $configDir = $env:CENTER_WINDOW_BATDIR
 if (-not $configDir) { $configDir = [System.IO.Path]::GetDirectoryName($MyInvocation.MyCommand.Path) }
+$script:batFile = $env:CENTER_WINDOW_BATFILE
+if (-not $script:batFile) { $script:batFile = "" }
 $errorLog = Join-Path $configDir "WindowCenterTool_error.log"
 $selfPath = $MyInvocation.MyCommand.Path
 if ($selfPath -and (Test-Path $selfPath)) { Remove-Item $selfPath -Force -ErrorAction SilentlyContinue }
@@ -50,21 +54,19 @@ public class WinAPI
     [DllImport("user32.dll")]
     public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
     [DllImport("user32.dll")]
+    public static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
+    [DllImport("user32.dll")]
     public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
     [DllImport("user32.dll")]
     public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
     [DllImport("user32.dll")]
     public static extern bool IsZoomed(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetAncestor(IntPtr hWnd, uint gaFlags);
     [DllImport("kernel32.dll")]
     public static extern bool FreeConsole();
-    [DllImport("user32.dll", SetLastError = true)]
-    public static extern IntPtr SetParent(IntPtr hWndChild, IntPtr hWndNewParent);
-    [DllImport("user32.dll")]
-    public static extern IntPtr CreateWindowEx(uint dwExStyle, string lpClassName, string lpWindowName, uint dwStyle, int x, int y, int nWidth, int nHeight, IntPtr hWndParent, IntPtr hMenu, IntPtr hInstance, IntPtr lpParam);
-    [DllImport("user32.dll")]
-    public static extern bool DestroyWindow(IntPtr hWnd);
     [DllImport("kernel32.dll")]
-    public static extern IntPtr GetModuleHandle(string lpModuleName);
+    public static extern bool SetProcessWorkingSetSize(IntPtr hProcess, int dwMinimumWorkingSetSize, int dwMaximumWorkingSetSize);
 
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT
@@ -83,6 +85,7 @@ public class WinAPI
     public const uint SWP_NOSIZE   = 0x0001;
     public const uint SWP_NOZORDER = 0x0004;
     public const uint SWP_NOACTIVATE = 0x0010;
+    public const uint GA_ROOT = 2;
     public static readonly IntPtr HWND_MESSAGE = new IntPtr(-3);
 }
 
@@ -90,7 +93,6 @@ public class MessageOnlyWindow : NativeWindow
 {
     public event Action HotkeyPressed;
     public const int WM_HOTKEY = 0x0312;
-    public const int WM_DESTROY = 0x0002;
 
     public MessageOnlyWindow()
     {
@@ -113,6 +115,7 @@ public class MessageOnlyWindow : NativeWindow
 "@ -ReferencedAssemblies System.Windows.Forms
 
     [WinAPI]::FreeConsole() | Out-Null
+    [WinAPI]::SetProcessWorkingSetSize((Get-Process -Id $pid).Handle, -1, -1) | Out-Null
 
     $WM_HOTKEY = 0x0312
     $MOD_ALT     = 0x0001
@@ -175,24 +178,32 @@ public class MessageOnlyWindow : NativeWindow
     }
 
     function Center-ActiveWindow {
-        $hwnd = [WinAPI]::GetForegroundWindow()
-        if ($hwnd -eq [IntPtr]::Zero) { return }
+        $hwndFore = [WinAPI]::GetForegroundWindow()
+        if ($hwndFore -eq [IntPtr]::Zero) { return }
+
+        $hwnd = [WinAPI]::GetAncestor($hwndFore, [WinAPI]::GA_ROOT)
         if ([WinAPI]::IsZoomed($hwnd)) { return }
+
         $rect = New-Object WinAPI+RECT
         if (-not [WinAPI]::GetWindowRect($hwnd, [ref]$rect)) { return }
+
         $wWidth  = $rect.Right  - $rect.Left
         $wHeight = $rect.Bottom - $rect.Top
         if ($wWidth -le 0 -or $wHeight -le 0) { return }
+
         $hMonitor = [WinAPI]::MonitorFromWindow($hwnd, [WinAPI]::MONITOR_DEFAULTTONEAREST)
         $monInfo = New-Object WinAPI+MONITORINFO
         $monInfo.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($monInfo)
         if (-not [WinAPI]::GetMonitorInfo($hMonitor, [ref]$monInfo)) { return }
+
         if ($script:config.CenteringMode -eq "RespectTaskbar") { $bounds = $monInfo.rcWork }
         else { $bounds = $monInfo.rcMonitor }
+
         if (($rect.Left  -le $bounds.Left)  -and ($rect.Top    -le $bounds.Top) -and
             ($rect.Right -ge $bounds.Right) -and ($rect.Bottom -ge $bounds.Bottom)) {
             return
         }
+
         $newX = $bounds.Left + [Math]::Floor(($bounds.Right - $bounds.Left - $wWidth) / 2)
         $newY = $bounds.Top  + [Math]::Floor(($bounds.Bottom - $bounds.Top - $wHeight) / 2)
         $newX = [Math]::Max($bounds.Left, $newX)
@@ -203,8 +214,14 @@ public class MessageOnlyWindow : NativeWindow
         if ($newY -gt $maxY) { $newY = $maxY }
         if ($newX -lt $bounds.Left) { $newX = $bounds.Left }
         if ($newY -lt $bounds.Top)  { $newY = $bounds.Top }
-        $flags = [WinAPI]::SWP_NOSIZE -bor [WinAPI]::SWP_NOZORDER -bor [WinAPI]::SWP_NOACTIVATE
-        [WinAPI]::SetWindowPos($hwnd, [IntPtr]::Zero, $newX, $newY, 0, 0, $flags) | Out-Null
+
+        $result = [WinAPI]::SetWindowPos($hwnd, [IntPtr]::Zero, $newX, $newY, 0, 0,
+            [WinAPI]::SWP_NOSIZE -bor [WinAPI]::SWP_NOZORDER -bor [WinAPI]::SWP_NOACTIVATE)
+        if (-not $result) {
+            [WinAPI]::MoveWindow($hwnd, $newX, $newY, $wWidth, $wHeight, $true) | Out-Null
+        }
+
+        [WinAPI]::SetProcessWorkingSetSize((Get-Process -Id $pid).Handle, -1, -1) | Out-Null
     }
 
     $global:iconBitmap = New-Object System.Drawing.Bitmap(16, 16)
@@ -233,11 +250,35 @@ public class MessageOnlyWindow : NativeWindow
     }
     Protect-TrayIcon
 
+    function Restart-AsAdmin {
+        Save-Config $script:config
+        [WinAPI]::UnregisterHotKey($script:msgWindow.Handle, $script:hotkeyIds.Primary)
+        [WinAPI]::UnregisterHotKey($script:msgWindow.Handle, $script:hotkeyIds.Secondary)
+
+        if (-not $script:batFile) {
+            [System.Windows.Forms.MessageBox]::Show("Cannot restart: batch file path unknown.", "Window Centering Tool", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+            return
+        }
+        try {
+            Start-Process -FilePath $script:batFile -Verb RunAs -ErrorAction Stop
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show("Administrator elevation was cancelled or failed. The tool will continue without admin rights.", "Window Centering Tool", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+            return
+        }
+
+        $script:notifyIcon.Visible = $false
+        $script:notifyIcon.Dispose()
+        $script:msgWindow.DestroyHandle()
+        [System.Windows.Forms.Application]::Exit()
+    }
+
     $contextMenu = New-Object System.Windows.Forms.ContextMenuStrip
     $script:menuSettings = New-Object System.Windows.Forms.ToolStripMenuItem -Property @{Text = "Settings"}
     $script:menuPause    = New-Object System.Windows.Forms.ToolStripMenuItem -Property @{Text = "Pause Hotkey"; CheckOnClick = $true}
+    $script:menuRestart  = New-Object System.Windows.Forms.ToolStripMenuItem -Property @{Text = "Restart as Administrator"}
     $script:menuExit     = New-Object System.Windows.Forms.ToolStripMenuItem -Property @{Text = "Exit"}
-    $contextMenu.Items.AddRange(@($script:menuSettings, $script:menuPause, $script:menuExit))
+    $contextMenu.Items.AddRange(@($script:menuSettings, $script:menuPause, $script:menuRestart, $script:menuExit))
     $script:notifyIcon.ContextMenuStrip = $contextMenu
 
     $script:notifyIcon.Add_Click({
@@ -248,6 +289,7 @@ public class MessageOnlyWindow : NativeWindow
         $script:paused = $script:menuPause.Checked
         Update-HotkeyRegistration
     })
+    $script:menuRestart.Add_Click({ Restart-AsAdmin })
     $script:menuExit.Add_Click({
         [WinAPI]::UnregisterHotKey($script:msgWindow.Handle, $script:hotkeyIds.Primary)
         [WinAPI]::UnregisterHotKey($script:msgWindow.Handle, $script:hotkeyIds.Secondary)
@@ -260,12 +302,56 @@ public class MessageOnlyWindow : NativeWindow
     $script:settingsForm = $null
     $script:txtHK1 = $null
     $script:txtHK2 = $null
+    $script:pendingHK1 = $null
+    $script:pendingHK2 = $null
+
+    function Format-HotkeyString {
+        param($hotkey)
+        if (-not $hotkey) { return "None" }
+        $mods = $hotkey.Modifiers
+        $key  = $hotkey.Key
+        if ([string]::IsNullOrEmpty($mods)) { return $key }
+        return "$mods+$key"
+    }
+
+    function HotkeysDiffer {
+        param($a, $b)
+        if ($a -eq $null -and $b -eq $null) { return $false }
+        if ($a -eq $null -or $b -eq $null) { return $true }
+        return ($a.Modifiers -ne $b.Modifiers) -or ($a.Key -ne $b.Key) -or
+               ($a.ModifierFlags -ne $b.ModifierFlags) -or ($a.VirtualKey -ne $b.VirtualKey)
+    }
+
+    function Reset-SettingsFields {
+        $script:pendingHK1 = if ($script:config.Hotkey1) { @{
+            Modifiers = $script:config.Hotkey1.Modifiers
+            Key = $script:config.Hotkey1.Key
+            ModifierFlags = $script:config.Hotkey1.ModifierFlags
+            VirtualKey = $script:config.Hotkey1.VirtualKey
+        }} else { $null }
+        $script:pendingHK2 = if ($script:config.Hotkey2) { @{
+            Modifiers = $script:config.Hotkey2.Modifiers
+            Key = $script:config.Hotkey2.Key
+            ModifierFlags = $script:config.Hotkey2.ModifierFlags
+            VirtualKey = $script:config.Hotkey2.VirtualKey
+        }} else { $null }
+        if ($script:txtHK1) { $script:txtHK1.Text = Format-HotkeyString $script:pendingHK1 }
+        if ($script:txtHK2) { $script:txtHK2.Text = Format-HotkeyString $script:pendingHK2 }
+    }
 
     function Show-SettingsWindow {
         if ($script:settingsForm -and $script:settingsForm.Visible) {
             $script:settingsForm.BringToFront()
             return
         }
+        if ($script:settingsForm) {
+            Reset-SettingsFields
+            $script:settingsForm.TopMost = $true
+            $script:settingsForm.Show()
+            $script:settingsForm.BringToFront()
+            return
+        }
+
         $script:settingsForm = New-Object System.Windows.Forms.Form
         $script:settingsForm.Text = "Window Centering Settings"
         $script:settingsForm.Size = New-Object System.Drawing.Size(390, 290)
@@ -280,6 +366,8 @@ public class MessageOnlyWindow : NativeWindow
         $script:settingsForm.BackColor = $darkBack
         $script:settingsForm.ForeColor = $darkFore
 
+        Reset-SettingsFields
+
         $lblHK1 = New-Object System.Windows.Forms.Label
         $lblHK1.Text = "Primary Hotkey:"
         $lblHK1.Location = New-Object System.Drawing.Point(12, 15)
@@ -292,7 +380,7 @@ public class MessageOnlyWindow : NativeWindow
         $script:txtHK1.ReadOnly = $true
         $script:txtHK1.BackColor = [System.Drawing.Color]::FromArgb(45, 45, 45)
         $script:txtHK1.ForeColor = $darkFore
-        $script:txtHK1.Text = Format-HotkeyString $script:config.Hotkey1
+        $script:txtHK1.Text = Format-HotkeyString $script:pendingHK1
 
         $btnRecordHK1 = New-Object System.Windows.Forms.Button
         $btnRecordHK1.Text = "Record"
@@ -318,7 +406,7 @@ public class MessageOnlyWindow : NativeWindow
         $script:txtHK2.ReadOnly = $true
         $script:txtHK2.BackColor = [System.Drawing.Color]::FromArgb(45, 45, 45)
         $script:txtHK2.ForeColor = $darkFore
-        $script:txtHK2.Text = if ($script:config.Hotkey2) { Format-HotkeyString $script:config.Hotkey2 } else { "None" }
+        $script:txtHK2.Text = Format-HotkeyString $script:pendingHK2
 
         $btnRecordHK2 = New-Object System.Windows.Forms.Button
         $btnRecordHK2.Text = "Record"
@@ -340,27 +428,25 @@ public class MessageOnlyWindow : NativeWindow
         $btnClearHK2.ForeColor = $darkFore
         $btnClearHK2.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
         $btnClearHK2.Add_Click({
-            $script:config.Hotkey2 = $null
+            $script:pendingHK2 = $null
             $script:txtHK2.Text = "None"
-            Save-Config $script:config
-            Update-HotkeyRegistration
         })
 
         $grpMode = New-Object System.Windows.Forms.GroupBox
         $grpMode.Text = "Centering Mode"
         $grpMode.Location = New-Object System.Drawing.Point(12, 110)
-        $grpMode.Size = New-Object System.Drawing.Size(340, 70)
+        $grpMode.Size = New-Object System.Drawing.Size(340, 60)
         $grpMode.ForeColor = $darkFore
 
         $radRespect = New-Object System.Windows.Forms.RadioButton
         $radRespect.Text = "Respect taskbar"
-        $radRespect.Location = New-Object System.Drawing.Point(15, 25)
+        $radRespect.Location = New-Object System.Drawing.Point(15, 22)
         $radRespect.Size = New-Object System.Drawing.Size(140, 20)
         $radRespect.ForeColor = $darkFore
 
         $radIgnore = New-Object System.Windows.Forms.RadioButton
         $radIgnore.Text = "Ignore taskbar"
-        $radIgnore.Location = New-Object System.Drawing.Point(170, 25)
+        $radIgnore.Location = New-Object System.Drawing.Point(170, 22)
         $radIgnore.Size = New-Object System.Drawing.Size(140, 20)
         $radIgnore.ForeColor = $darkFore
 
@@ -374,22 +460,58 @@ public class MessageOnlyWindow : NativeWindow
             if ($radIgnore.Checked) { $script:config.CenteringMode = "IgnoreTaskbar"; Save-Config $script:config }
         })
 
+        # Three horizontal action buttons
         $btnSave = New-Object System.Windows.Forms.Button
-        $btnSave.Text = "Save & Re-register"
-        $btnSave.Location = New-Object System.Drawing.Point(120, 200)
-        $btnSave.Size = New-Object System.Drawing.Size(140, 30)
+        $btnSave.Text = "Save"
+        $btnSave.Location = New-Object System.Drawing.Point(12, 190)
+        $btnSave.Size = New-Object System.Drawing.Size(105, 30)
         $btnSave.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 215)
         $btnSave.ForeColor = [System.Drawing.Color]::White
         $btnSave.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
         $btnSave.Add_Click({
+            if ($script:pendingHK1) { $script:config.Hotkey1 = $script:pendingHK1 } else { $script:config.Hotkey1 = $null }
+            if ($script:pendingHK2) { $script:config.Hotkey2 = $script:pendingHK2 } else { $script:config.Hotkey2 = $null }
             Save-Config $script:config
             Update-HotkeyRegistration
+            $script:pendingHK1 = if ($script:config.Hotkey1) { @{
+                Modifiers = $script:config.Hotkey1.Modifiers
+                Key = $script:config.Hotkey1.Key
+                ModifierFlags = $script:config.Hotkey1.ModifierFlags
+                VirtualKey = $script:config.Hotkey1.VirtualKey
+            }} else { $null }
+            $script:pendingHK2 = if ($script:config.Hotkey2) { @{
+                Modifiers = $script:config.Hotkey2.Modifiers
+                Key = $script:config.Hotkey2.Key
+                ModifierFlags = $script:config.Hotkey2.ModifierFlags
+                VirtualKey = $script:config.Hotkey2.VirtualKey
+            }} else { $null }
         })
+
+        $btnOpenConfig = New-Object System.Windows.Forms.Button
+        $btnOpenConfig.Text = "Open Config"
+        $btnOpenConfig.Location = New-Object System.Drawing.Point(125, 190)
+        $btnOpenConfig.Size = New-Object System.Drawing.Size(105, 30)
+        $btnOpenConfig.BackColor = [System.Drawing.Color]::FromArgb(60, 60, 60)
+        $btnOpenConfig.ForeColor = $darkFore
+        $btnOpenConfig.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+        $btnOpenConfig.Add_Click({
+            if (Test-Path $script:configFile) { Start-Process $script:configFile }
+            else { [System.Windows.Forms.MessageBox]::Show("Config file not found.`r`n$($script:configFile)", "Window Centering Tool", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information) }
+        })
+
+        $btnRestartAdmin = New-Object System.Windows.Forms.Button
+        $btnRestartAdmin.Text = "Restart Admin"
+        $btnRestartAdmin.Location = New-Object System.Drawing.Point(238, 190)
+        $btnRestartAdmin.Size = New-Object System.Drawing.Size(105, 30)
+        $btnRestartAdmin.BackColor = [System.Drawing.Color]::FromArgb(60, 60, 60)
+        $btnRestartAdmin.ForeColor = $darkFore
+        $btnRestartAdmin.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+        $btnRestartAdmin.Add_Click({ Restart-AsAdmin })
 
         $script:settingsForm.Controls.AddRange(@(
             $lblHK1, $script:txtHK1, $btnRecordHK1,
             $lblHK2, $script:txtHK2, $btnRecordHK2, $btnClearHK2,
-            $grpMode, $btnSave
+            $grpMode, $btnSave, $btnOpenConfig, $btnRestartAdmin
         ))
 
         $script:txtHK1.Add_KeyDown({
@@ -408,14 +530,12 @@ public class MessageOnlyWindow : NativeWindow
             $modifiersOnly = $modStr.TrimEnd('+')
             $display = if ($modifiersOnly.Length -gt 0) { "$modifiersOnly+$($e.KeyCode)" } else { $e.KeyCode.ToString() }
             $script:txtHK1.Text = $display
-            $script:config.Hotkey1 = @{
+            $script:pendingHK1 = @{
                 Modifiers = $modifiersOnly
                 Key = $e.KeyCode.ToString()
                 ModifierFlags = $mods
                 VirtualKey = $keyCode
             }
-            Save-Config $script:config
-            Update-HotkeyRegistration
             $e.SuppressKeyPress = $true
         })
 
@@ -435,33 +555,43 @@ public class MessageOnlyWindow : NativeWindow
             $modifiersOnly = $modStr.TrimEnd('+')
             $display = if ($modifiersOnly.Length -gt 0) { "$modifiersOnly+$($e.KeyCode)" } else { $e.KeyCode.ToString() }
             $script:txtHK2.Text = $display
-            $script:config.Hotkey2 = @{
+            $script:pendingHK2 = @{
                 Modifiers = $modifiersOnly
                 Key = $e.KeyCode.ToString()
                 ModifierFlags = $mods
                 VirtualKey = $keyCode
             }
-            Save-Config $script:config
-            Update-HotkeyRegistration
             $e.SuppressKeyPress = $true
         })
 
         $script:settingsForm.Add_FormClosing({
             if ($_.CloseReason -eq [System.Windows.Forms.CloseReason]::UserClosing) {
+                $changed = (HotkeysDiffer $script:pendingHK1 $script:config.Hotkey1) -or
+                           (HotkeysDiffer $script:pendingHK2 $script:config.Hotkey2)
+                if ($changed) {
+                    $result = [System.Windows.Forms.MessageBox]::Show(
+                        "Do you want to save hotkey changes?",
+                        "Window Centering Tool",
+                        [System.Windows.Forms.MessageBoxButtons]::YesNoCancel,
+                        [System.Windows.Forms.MessageBoxIcon]::Question)
+                    if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
+                        if ($script:pendingHK1) { $script:config.Hotkey1 = $script:pendingHK1 } else { $script:config.Hotkey1 = $null }
+                        if ($script:pendingHK2) { $script:config.Hotkey2 = $script:pendingHK2 } else { $script:config.Hotkey2 = $null }
+                        Save-Config $script:config
+                        Update-HotkeyRegistration
+                    }
+                    if ($result -eq [System.Windows.Forms.DialogResult]::Cancel) {
+                        $_.Cancel = $true
+                        return
+                    }
+                }
                 $_.Cancel = $true
                 $script:settingsForm.Hide()
+                [WinAPI]::SetProcessWorkingSetSize((Get-Process -Id $pid).Handle, -1, -1) | Out-Null
             }
         })
-        $script:settingsForm.Show()
-    }
 
-    function Format-HotkeyString {
-        param($hotkey)
-        if (-not $hotkey) { return "None" }
-        $mods = $hotkey.Modifiers
-        $key  = $hotkey.Key
-        if ([string]::IsNullOrEmpty($mods)) { return $key }
-        return "$mods+$key"
+        $script:settingsForm.Show()
     }
 
     Update-HotkeyRegistration
@@ -483,7 +613,10 @@ catch {
     $msg += "Full Exception Details:`r`n$($_.Exception.ToString())`r`n"
     $msg += "Stack Trace:`r`n$($_.ScriptStackTrace)`r`n"
     $msg += "`r`n`$Error[0]:`r`n$($Error[0] | Out-String)`r`n"
+
     Set-Content -Path $errorLog -Value $msg -Encoding UTF8
     [System.Windows.Forms.MessageBox]::Show("The tool encountered an error:`r`n`r`n$($_.Exception.Message)`r`n`r`nSee $errorLog for details.", "Window Centering Tool Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+
+    if (Test-Path $errorLog) { Start-Process $errorLog }
 }
 :PS_END
