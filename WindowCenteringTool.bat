@@ -32,6 +32,9 @@ REM The batch file's job is done – the tool runs in the background now
 exit /b
 
 :PS_START
+#region Bootstrap & error trap
+# NOTE: $ErrorActionPreference='Stop' is set by the launcher (Task 2) so unhandled
+# errors route into this catch{}. For now the existing default is preserved.
 $configDir = $env:CENTER_WINDOW_BATDIR
 if (-not $configDir) { $configDir = [System.IO.Path]::GetDirectoryName($MyInvocation.MyCommand.Path) }
 $script:batFile = $env:CENTER_WINDOW_BATFILE
@@ -41,9 +44,45 @@ $selfPath = $MyInvocation.MyCommand.Path
 if ($selfPath -and (Test-Path $selfPath)) { Remove-Item $selfPath -Force -ErrorAction SilentlyContinue }
 
 try {
+#endregion
+
+#region Paths & Config
     $script:configFile = Join-Path $configDir "WindowCenteringTool.json"
     Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 
+    $WM_HOTKEY = 0x0312
+    $MOD_ALT     = 0x0001
+    $MOD_CONTROL = 0x0002
+    $MOD_SHIFT   = 0x0004
+    $MOD_WIN     = 0x0008
+
+    $script:hotkeyIds = @{ Primary = 1; Secondary = 2 }
+
+    $script:defaultConfig = [PSCustomObject]@{
+        Hotkey1 = @{ Modifiers = "Control+Shift"; Key = "C"; ModifierFlags = 6; VirtualKey = 0x43 }
+        Hotkey2 = $null
+        CenteringMode = "RespectTaskbar"
+    }
+
+    function Load-Config {
+        if (Test-Path $script:configFile) {
+            try {
+                $cfg = Get-Content $script:configFile -Raw | ConvertFrom-Json
+                if (-not $cfg.Hotkey1) { $cfg.Hotkey1 = $script:defaultConfig.Hotkey1 }
+                if (-not $cfg.CenteringMode) { $cfg.CenteringMode = $script:defaultConfig.CenteringMode }
+                return $cfg
+            } catch { Write-Warning "Config corrupted, using defaults" }
+        }
+        return $script:defaultConfig | ConvertTo-Json -Depth 4 | ConvertFrom-Json
+    }
+
+    function Save-Config {
+        param($config)
+        $config | ConvertTo-Json -Depth 4 | Set-Content $script:configFile -Encoding UTF8
+    }
+#endregion
+
+#region Native interop (WinAPI P/Invoke + MessageOnlyWindow)
     Add-Type -TypeDefinition @"
 using System;
 using System.Runtime.InteropServices;
@@ -121,40 +160,11 @@ public class MessageOnlyWindow : NativeWindow
     }
 }
 "@ -ReferencedAssemblies System.Windows.Forms
+#endregion
 
+#region App state
     [WinAPI]::FreeConsole() | Out-Null
     [WinAPI]::SetProcessWorkingSetSize((Get-Process -Id $pid).Handle, -1, -1) | Out-Null
-
-    $WM_HOTKEY = 0x0312
-    $MOD_ALT     = 0x0001
-    $MOD_CONTROL = 0x0002
-    $MOD_SHIFT   = 0x0004
-    $MOD_WIN     = 0x0008
-
-    $script:hotkeyIds = @{ Primary = 1; Secondary = 2 }
-
-    $script:defaultConfig = [PSCustomObject]@{
-        Hotkey1 = @{ Modifiers = "Control+Shift"; Key = "C"; ModifierFlags = 6; VirtualKey = 0x43 }
-        Hotkey2 = $null
-        CenteringMode = "RespectTaskbar"
-    }
-
-    function Load-Config {
-        if (Test-Path $script:configFile) {
-            try {
-                $cfg = Get-Content $script:configFile -Raw | ConvertFrom-Json
-                if (-not $cfg.Hotkey1) { $cfg.Hotkey1 = $script:defaultConfig.Hotkey1 }
-                if (-not $cfg.CenteringMode) { $cfg.CenteringMode = $script:defaultConfig.CenteringMode }
-                return $cfg
-            } catch { Write-Warning "Config corrupted, using defaults" }
-        }
-        return $script:defaultConfig | ConvertTo-Json -Depth 4 | ConvertFrom-Json
-    }
-
-    function Save-Config {
-        param($config)
-        $config | ConvertTo-Json -Depth 4 | Set-Content $script:configFile -Encoding UTF8
-    }
 
     $script:config = Load-Config
     $script:paused = $false
@@ -162,29 +172,14 @@ public class MessageOnlyWindow : NativeWindow
     $script:msgWindow = New-Object MessageOnlyWindow
     $script:msgWindow.add_HotkeyPressed({ Center-ActiveWindow })
 
-    function Update-HotkeyRegistration {
-        [WinAPI]::UnregisterHotKey($script:msgWindow.Handle, $script:hotkeyIds.Primary)   | Out-Null
-        [WinAPI]::UnregisterHotKey($script:msgWindow.Handle, $script:hotkeyIds.Secondary) | Out-Null
-        if (-not $script:paused) {
-            if ($script:config.Hotkey1) {
-                $mod = [uint32]$script:config.Hotkey1.ModifierFlags
-                $vk  = [uint32]$script:config.Hotkey1.VirtualKey
-                $success = [WinAPI]::RegisterHotKey($script:msgWindow.Handle, $script:hotkeyIds.Primary, $mod, $vk)
-                if (-not $success) {
-                    $script:notifyIcon.BalloonTipTitle = "Hotkey Registration Failed"
-                    $script:notifyIcon.BalloonTipText  = "Could not register primary hotkey (maybe already in use)."
-                    $script:notifyIcon.BalloonTipIcon  = [System.Windows.Forms.ToolTipIcon]::Warning
-                    $script:notifyIcon.ShowBalloonTip(5000)
-                }
-            }
-            if ($script:config.Hotkey2) {
-                $mod = [uint32]$script:config.Hotkey2.ModifierFlags
-                $vk  = [uint32]$script:config.Hotkey2.VirtualKey
-                [WinAPI]::RegisterHotKey($script:msgWindow.Handle, $script:hotkeyIds.Secondary, $mod, $vk) | Out-Null
-            }
-        }
-    }
+    $script:settingsForm = $null
+    $script:txtHK1 = $null
+    $script:txtHK2 = $null
+    $script:pendingHK1 = $null
+    $script:pendingHK2 = $null
+#endregion
 
+#region Centering logic
     function Center-ActiveWindow {
         $hwndFore = [WinAPI]::GetForegroundWindow()
         if ($hwndFore -eq [IntPtr]::Zero) { return }
@@ -231,7 +226,34 @@ public class MessageOnlyWindow : NativeWindow
 
         [WinAPI]::SetProcessWorkingSetSize((Get-Process -Id $pid).Handle, -1, -1) | Out-Null
     }
+#endregion
 
+#region Hotkey registration
+    function Update-HotkeyRegistration {
+        [WinAPI]::UnregisterHotKey($script:msgWindow.Handle, $script:hotkeyIds.Primary)   | Out-Null
+        [WinAPI]::UnregisterHotKey($script:msgWindow.Handle, $script:hotkeyIds.Secondary) | Out-Null
+        if (-not $script:paused) {
+            if ($script:config.Hotkey1) {
+                $mod = [uint32]$script:config.Hotkey1.ModifierFlags
+                $vk  = [uint32]$script:config.Hotkey1.VirtualKey
+                $success = [WinAPI]::RegisterHotKey($script:msgWindow.Handle, $script:hotkeyIds.Primary, $mod, $vk)
+                if (-not $success) {
+                    $script:notifyIcon.BalloonTipTitle = "Hotkey Registration Failed"
+                    $script:notifyIcon.BalloonTipText  = "Could not register primary hotkey (maybe already in use)."
+                    $script:notifyIcon.BalloonTipIcon  = [System.Windows.Forms.ToolTipIcon]::Warning
+                    $script:notifyIcon.ShowBalloonTip(5000)
+                }
+            }
+            if ($script:config.Hotkey2) {
+                $mod = [uint32]$script:config.Hotkey2.ModifierFlags
+                $vk  = [uint32]$script:config.Hotkey2.VirtualKey
+                [WinAPI]::RegisterHotKey($script:msgWindow.Handle, $script:hotkeyIds.Secondary, $mod, $vk) | Out-Null
+            }
+        }
+    }
+#endregion
+
+#region Tray (icon / menu / events)
     # Build a simple tray icon
     $global:iconBitmap = New-Object System.Drawing.Bitmap(16, 16)
     $g = [System.Drawing.Graphics]::FromImage($global:iconBitmap)
@@ -262,29 +284,6 @@ public class MessageOnlyWindow : NativeWindow
     }
     Protect-TrayIcon
 
-    function Restart-AsAdmin {
-        Save-Config $script:config
-        [WinAPI]::UnregisterHotKey($script:msgWindow.Handle, $script:hotkeyIds.Primary)
-        [WinAPI]::UnregisterHotKey($script:msgWindow.Handle, $script:hotkeyIds.Secondary)
-
-        if (-not $script:batFile) {
-            [System.Windows.Forms.MessageBox]::Show("Cannot restart: batch file path unknown.", "Window Centering Tool", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
-            return
-        }
-        try {
-            Start-Process -FilePath $script:batFile -Verb RunAs -ErrorAction Stop
-        }
-        catch {
-            [System.Windows.Forms.MessageBox]::Show("Administrator elevation was cancelled or failed. The tool will continue without admin rights.", "Window Centering Tool", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
-            return
-        }
-
-        $script:notifyIcon.Visible = $false
-        $script:notifyIcon.Dispose()
-        $script:msgWindow.DestroyHandle()
-        [System.Windows.Forms.Application]::Exit()
-    }
-
     $contextMenu = New-Object System.Windows.Forms.ContextMenuStrip
     $script:menuSettings = New-Object System.Windows.Forms.ToolStripMenuItem -Property @{Text = "Settings"}
     $script:menuPause    = New-Object System.Windows.Forms.ToolStripMenuItem -Property @{Text = "Pause Hotkey"; CheckOnClick = $true}
@@ -302,14 +301,7 @@ public class MessageOnlyWindow : NativeWindow
         Update-HotkeyRegistration
     })
     $script:menuRestart.Add_Click({ Restart-AsAdmin })
-    $script:menuExit.Add_Click({
-        [WinAPI]::UnregisterHotKey($script:msgWindow.Handle, $script:hotkeyIds.Primary)
-        [WinAPI]::UnregisterHotKey($script:msgWindow.Handle, $script:hotkeyIds.Secondary)
-        $script:notifyIcon.Visible = $false
-        $script:notifyIcon.Dispose()
-        $script:msgWindow.DestroyHandle()
-        [System.Windows.Forms.Application]::Exit()
-    })
+    $script:menuExit.Add_Click({ Stop-Application })
 
     # Periodic memory trimming (every 5 minutes)
     $trimTimer = New-Object System.Windows.Forms.Timer
@@ -318,13 +310,9 @@ public class MessageOnlyWindow : NativeWindow
         [WinAPI]::SetProcessWorkingSetSize((Get-Process -Id $pid).Handle, -1, -1) | Out-Null
     })
     $trimTimer.Start()
+#endregion
 
-    $script:settingsForm = $null
-    $script:txtHK1 = $null
-    $script:txtHK2 = $null
-    $script:pendingHK1 = $null
-    $script:pendingHK2 = $null
-
+#region Settings UI
     function Format-HotkeyString {
         param($hotkey)
         if (-not $hotkey) { return "None" }
@@ -342,19 +330,49 @@ public class MessageOnlyWindow : NativeWindow
                ($a.ModifierFlags -ne $b.ModifierFlags) -or ($a.VirtualKey -ne $b.VirtualKey)
     }
 
+    # Returns a fresh hashtable copy of a hotkey object (or $null). Replaces the
+    # repeated inline @{ Modifiers=...; Key=...; ModifierFlags=...; VirtualKey=... } copies.
+    function Copy-HotkeyObject {
+        param($hotkey)
+        if (-not $hotkey) { return $null }
+        return @{
+            Modifiers      = $hotkey.Modifiers
+            Key            = $hotkey.Key
+            ModifierFlags  = $hotkey.ModifierFlags
+            VirtualKey     = $hotkey.VirtualKey
+        }
+    }
+
+    # Pure logic: parse a WinForms KeyEventArgs into a hotkey descriptor, or $null
+    # if only a bare modifier key (Shift/Ctrl/Alt) was pressed. Returns a hashtable
+    # with Display, Modifiers, Key, ModifierFlags, VirtualKey. Pure (no $script: writes),
+    # so the inline Add_KeyDown handlers below stay scope-safe while staying small.
+    function Get-HotkeyFromKeyArgs {
+        param($e)
+        $mods = 0
+        if ($e.Control) { $mods = $mods -bor $MOD_CONTROL }
+        if ($e.Shift)   { $mods = $mods -bor $MOD_SHIFT }
+        if ($e.Alt)     { $mods = $mods -bor $MOD_ALT }
+        $keyCode = [int]$e.KeyCode
+        if ($keyCode -in 0x10, 0x11, 0x12) { return $null }
+        $modStr = ""
+        if ($e.Control) { $modStr += "Control+" }
+        if ($e.Shift)   { $modStr += "Shift+" }
+        if ($e.Alt)     { $modStr += "Alt+" }
+        $modifiersOnly = $modStr.TrimEnd('+')
+        $display = if ($modifiersOnly.Length -gt 0) { "$modifiersOnly+$($e.KeyCode)" } else { $e.KeyCode.ToString() }
+        return @{
+            Display        = $display
+            Modifiers      = $modifiersOnly
+            Key            = $e.KeyCode.ToString()
+            ModifierFlags  = $mods
+            VirtualKey     = $keyCode
+        }
+    }
+
     function Reset-SettingsFields {
-        $script:pendingHK1 = if ($script:config.Hotkey1) { @{
-            Modifiers = $script:config.Hotkey1.Modifiers
-            Key = $script:config.Hotkey1.Key
-            ModifierFlags = $script:config.Hotkey1.ModifierFlags
-            VirtualKey = $script:config.Hotkey1.VirtualKey
-        }} else { $null }
-        $script:pendingHK2 = if ($script:config.Hotkey2) { @{
-            Modifiers = $script:config.Hotkey2.Modifiers
-            Key = $script:config.Hotkey2.Key
-            ModifierFlags = $script:config.Hotkey2.ModifierFlags
-            VirtualKey = $script:config.Hotkey2.VirtualKey
-        }} else { $null }
+        $script:pendingHK1 = Copy-HotkeyObject $script:config.Hotkey1
+        $script:pendingHK2 = Copy-HotkeyObject $script:config.Hotkey2
         if ($script:txtHK1) { $script:txtHK1.Text = Format-HotkeyString $script:pendingHK1 }
         if ($script:txtHK2) { $script:txtHK2.Text = Format-HotkeyString $script:pendingHK2 }
     }
@@ -493,18 +511,8 @@ public class MessageOnlyWindow : NativeWindow
             if ($script:pendingHK2) { $script:config.Hotkey2 = $script:pendingHK2 } else { $script:config.Hotkey2 = $null }
             Save-Config $script:config
             Update-HotkeyRegistration
-            $script:pendingHK1 = if ($script:config.Hotkey1) { @{
-                Modifiers = $script:config.Hotkey1.Modifiers
-                Key = $script:config.Hotkey1.Key
-                ModifierFlags = $script:config.Hotkey1.ModifierFlags
-                VirtualKey = $script:config.Hotkey1.VirtualKey
-            }} else { $null }
-            $script:pendingHK2 = if ($script:config.Hotkey2) { @{
-                Modifiers = $script:config.Hotkey2.Modifiers
-                Key = $script:config.Hotkey2.Key
-                ModifierFlags = $script:config.Hotkey2.ModifierFlags
-                VirtualKey = $script:config.Hotkey2.VirtualKey
-            }} else { $null }
+            $script:pendingHK1 = Copy-HotkeyObject $script:config.Hotkey1
+            $script:pendingHK2 = Copy-HotkeyObject $script:config.Hotkey2
         })
 
         $btnOpenConfig = New-Object System.Windows.Forms.Button
@@ -534,27 +542,20 @@ public class MessageOnlyWindow : NativeWindow
             $grpMode, $btnSave, $btnOpenConfig, $btnRestartAdmin
         ))
 
+        # KeyDown handlers stay inline (WinForms passes $sender,$e and inline
+        # scriptblocks close cleanly over $script: scope). They delegate the pure
+        # parse to Get-HotkeyFromKeyArgs so the two slots share one implementation.
         $script:txtHK1.Add_KeyDown({
             $e = $_
             if ($script:txtHK1.Text -eq "Press keys...") { $script:txtHK1.Text = "" }
-            $mods = 0
-            if ($e.Control) { $mods = $mods -bor $MOD_CONTROL }
-            if ($e.Shift)   { $mods = $mods -bor $MOD_SHIFT }
-            if ($e.Alt)     { $mods = $mods -bor $MOD_ALT }
-            $keyCode = [int]$e.KeyCode
-            if ($keyCode -in 0x10, 0x11, 0x12) { return }
-            $modStr = ""
-            if ($e.Control) { $modStr += "Control+" }
-            if ($e.Shift)   { $modStr += "Shift+" }
-            if ($e.Alt)     { $modStr += "Alt+" }
-            $modifiersOnly = $modStr.TrimEnd('+')
-            $display = if ($modifiersOnly.Length -gt 0) { "$modifiersOnly+$($e.KeyCode)" } else { $e.KeyCode.ToString() }
-            $script:txtHK1.Text = $display
+            $hk = Get-HotkeyFromKeyArgs $e
+            if (-not $hk) { return }
+            $script:txtHK1.Text = $hk.Display
             $script:pendingHK1 = @{
-                Modifiers = $modifiersOnly
-                Key = $e.KeyCode.ToString()
-                ModifierFlags = $mods
-                VirtualKey = $keyCode
+                Modifiers      = $hk.Modifiers
+                Key            = $hk.Key
+                ModifierFlags  = $hk.ModifierFlags
+                VirtualKey     = $hk.VirtualKey
             }
             $e.SuppressKeyPress = $true
         })
@@ -562,24 +563,14 @@ public class MessageOnlyWindow : NativeWindow
         $script:txtHK2.Add_KeyDown({
             $e = $_
             if ($script:txtHK2.Text -eq "Press keys...") { $script:txtHK2.Text = "" }
-            $mods = 0
-            if ($e.Control) { $mods = $mods -bor $MOD_CONTROL }
-            if ($e.Shift)   { $mods = $mods -bor $MOD_SHIFT }
-            if ($e.Alt)     { $mods = $mods -bor $MOD_ALT }
-            $keyCode = [int]$e.KeyCode
-            if ($keyCode -in 0x10, 0x11, 0x12) { return }
-            $modStr = ""
-            if ($e.Control) { $modStr += "Control+" }
-            if ($e.Shift)   { $modStr += "Shift+" }
-            if ($e.Alt)     { $modStr += "Alt+" }
-            $modifiersOnly = $modStr.TrimEnd('+')
-            $display = if ($modifiersOnly.Length -gt 0) { "$modifiersOnly+$($e.KeyCode)" } else { $e.KeyCode.ToString() }
-            $script:txtHK2.Text = $display
+            $hk = Get-HotkeyFromKeyArgs $e
+            if (-not $hk) { return }
+            $script:txtHK2.Text = $hk.Display
             $script:pendingHK2 = @{
-                Modifiers = $modifiersOnly
-                Key = $e.KeyCode.ToString()
-                ModifierFlags = $mods
-                VirtualKey = $keyCode
+                Modifiers      = $hk.Modifiers
+                Key            = $hk.Key
+                ModifierFlags  = $hk.ModifierFlags
+                VirtualKey     = $hk.VirtualKey
             }
             $e.SuppressKeyPress = $true
         })
@@ -611,12 +602,48 @@ public class MessageOnlyWindow : NativeWindow
                 $script:settingsForm.Hide()
                 [WinAPI]::SetProcessWorkingSetSize((Get-Process -Id $pid).Handle, -1, -1) | Out-Null
             }
-            # For ApplicationExit or WindowsShutDown we do nothing → form closes normally
+            # For ApplicationExit or WindowsShutDown we do nothing -> form closes normally
         })
 
         $script:settingsForm.Show()
     }
+#endregion
 
+#region Lifecycle (Restart-AsAdmin + Stop-Application)
+    function Restart-AsAdmin {
+        Save-Config $script:config
+
+        if (-not $script:batFile) {
+            [System.Windows.Forms.MessageBox]::Show("Cannot restart: batch file path unknown.", "Window Centering Tool", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+            return
+        }
+        try {
+            Start-Process -FilePath $script:batFile -Verb RunAs -ErrorAction Stop
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show("Administrator elevation was cancelled or failed. The tool will continue without admin rights.", "Window Centering Tool", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+            return
+        }
+
+        # Elevation succeeded: hand off to the new (elevated) instance and tear down.
+        Stop-Application
+    }
+
+    # Single teardown helper used by the Exit menu, Restart-AsAdmin, and reusable
+    # from catch{}. Replaces the previously-duplicated unregister/dispose/exit blocks.
+    function Stop-Application {
+        try { [WinAPI]::UnregisterHotKey($script:msgWindow.Handle, $script:hotkeyIds.Primary)   | Out-Null } catch {}
+        try { [WinAPI]::UnregisterHotKey($script:msgWindow.Handle, $script:hotkeyIds.Secondary) | Out-Null } catch {}
+        if ($script:notifyIcon) {
+            $script:notifyIcon.Visible = $false
+            $script:notifyIcon.Dispose()
+        }
+        if ($script:msgWindow) { try { $script:msgWindow.DestroyHandle() } catch {} }
+        [System.Windows.Forms.Application]::Exit()
+    }
+#endregion
+
+#region Startup
     Update-HotkeyRegistration
     [System.Windows.Forms.Application]::Run()
 }
@@ -642,4 +669,5 @@ catch {
 
     if (Test-Path $errorLog) { Start-Process $errorLog }
 }
+#endregion
 :PS_END
