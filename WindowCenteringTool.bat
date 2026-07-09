@@ -33,8 +33,6 @@ exit /b
 
 :PS_START
 #region Bootstrap & error trap
-# NOTE: $ErrorActionPreference='Stop' is set by the launcher (Task 2) so unhandled
-# errors route into this catch{}. For now the existing default is preserved.
 $configDir = $env:CENTER_WINDOW_BATDIR
 if (-not $configDir) { $configDir = [System.IO.Path]::GetDirectoryName($MyInvocation.MyCommand.Path) }
 $script:batFile = $env:CENTER_WINDOW_BATFILE
@@ -112,8 +110,6 @@ public class WinAPI
     public static extern IntPtr GetAncestor(IntPtr hWnd, uint gaFlags);
     [DllImport("kernel32.dll")]
     public static extern bool FreeConsole();
-    [DllImport("kernel32.dll")]
-    public static extern bool SetProcessWorkingSetSize(IntPtr hProcess, int dwMinimumWorkingSetSize, int dwMaximumWorkingSetSize);
 
     [StructLayout(LayoutKind.Sequential)]
     public struct RECT
@@ -164,7 +160,6 @@ public class MessageOnlyWindow : NativeWindow
 
 #region App state
     [WinAPI]::FreeConsole() | Out-Null
-    [WinAPI]::SetProcessWorkingSetSize((Get-Process -Id $pid).Handle, -1, -1) | Out-Null
 
     $script:config = Load-Config
     $script:paused = $false
@@ -177,6 +172,7 @@ public class MessageOnlyWindow : NativeWindow
     $script:txtHK2 = $null
     $script:pendingHK1 = $null
     $script:pendingHK2 = $null
+    $script:pendingMode = $script:config.CenteringMode
 #endregion
 
 #region Centering logic
@@ -223,8 +219,6 @@ public class MessageOnlyWindow : NativeWindow
         if (-not $result) {
             [WinAPI]::MoveWindow($hwnd, $newX, $newY, $wWidth, $wHeight, $true) | Out-Null
         }
-
-        [WinAPI]::SetProcessWorkingSetSize((Get-Process -Id $pid).Handle, -1, -1) | Out-Null
     }
 #endregion
 
@@ -254,7 +248,6 @@ public class MessageOnlyWindow : NativeWindow
 #endregion
 
 #region Tray (icon / menu / events)
-    # Build a simple tray icon
     $global:iconBitmap = New-Object System.Drawing.Bitmap(16, 16)
     $g = [System.Drawing.Graphics]::FromImage($global:iconBitmap)
     $g.Clear([System.Drawing.Color]::FromArgb(45,45,45))
@@ -267,22 +260,6 @@ public class MessageOnlyWindow : NativeWindow
     $script:notifyIcon.Text = "Window Centering Tool"
     $script:notifyIcon.Icon = $script:icon
     $script:notifyIcon.Visible = $true
-
-    # Keep the tray icon visible (Windows often hides unused icons)
-    function Protect-TrayIcon {
-        $regRoot = 'HKCU:\Control Panel\NotifyIconSettings'
-        if (Test-Path $regRoot) {
-            # Only promote the icon for THIS PowerShell process (exact executable path)
-            $myExe = (Get-Process -Id $pid).Path
-            Get-ChildItem -Path $regRoot -Recurse | ForEach-Object {
-                $ep = (Get-ItemProperty $_.PSPath -Name ExecutablePath -EA SilentlyContinue).ExecutablePath
-                if ($ep -eq $myExe) {
-                    Set-ItemProperty $_.PSPath -Name IsPromoted -Value 1 -Type DWORD -Force -ErrorAction SilentlyContinue
-                }
-            }
-        }
-    }
-    Protect-TrayIcon
 
     $contextMenu = New-Object System.Windows.Forms.ContextMenuStrip
     $script:menuSettings = New-Object System.Windows.Forms.ToolStripMenuItem -Property @{Text = "Settings"}
@@ -302,14 +279,6 @@ public class MessageOnlyWindow : NativeWindow
     })
     $script:menuRestart.Add_Click({ Restart-AsAdmin })
     $script:menuExit.Add_Click({ Stop-Application })
-
-    # Periodic memory trimming (every 5 minutes)
-    $trimTimer = New-Object System.Windows.Forms.Timer
-    $trimTimer.Interval = 300000  # 5 minutes in milliseconds
-    $trimTimer.Add_Tick({
-        [WinAPI]::SetProcessWorkingSetSize((Get-Process -Id $pid).Handle, -1, -1) | Out-Null
-    })
-    $trimTimer.Start()
 #endregion
 
 #region Settings UI
@@ -330,8 +299,6 @@ public class MessageOnlyWindow : NativeWindow
                ($a.ModifierFlags -ne $b.ModifierFlags) -or ($a.VirtualKey -ne $b.VirtualKey)
     }
 
-    # Returns a fresh hashtable copy of a hotkey object (or $null). Replaces the
-    # repeated inline @{ Modifiers=...; Key=...; ModifierFlags=...; VirtualKey=... } copies.
     function Copy-HotkeyObject {
         param($hotkey)
         if (-not $hotkey) { return $null }
@@ -343,10 +310,6 @@ public class MessageOnlyWindow : NativeWindow
         }
     }
 
-    # Pure logic: parse a WinForms KeyEventArgs into a hotkey descriptor, or $null
-    # if only a bare modifier key (Shift/Ctrl/Alt) was pressed. Returns a hashtable
-    # with Display, Modifiers, Key, ModifierFlags, VirtualKey. Pure (no $script: writes),
-    # so the inline Add_KeyDown handlers below stay scope-safe while staying small.
     function Get-HotkeyFromKeyArgs {
         param($e)
         $mods = 0
@@ -373,8 +336,13 @@ public class MessageOnlyWindow : NativeWindow
     function Reset-SettingsFields {
         $script:pendingHK1 = Copy-HotkeyObject $script:config.Hotkey1
         $script:pendingHK2 = Copy-HotkeyObject $script:config.Hotkey2
+        $script:pendingMode = $script:config.CenteringMode
         if ($script:txtHK1) { $script:txtHK1.Text = Format-HotkeyString $script:pendingHK1 }
         if ($script:txtHK2) { $script:txtHK2.Text = Format-HotkeyString $script:pendingHK2 }
+        if ($script:radRespect -and $script:radIgnore) {
+            $script:radRespect.Checked = ($script:pendingMode -eq "RespectTaskbar")
+            $script:radIgnore.Checked = ($script:pendingMode -eq "IgnoreTaskbar")
+        }
     }
 
     function Show-SettingsWindow {
@@ -476,29 +444,30 @@ public class MessageOnlyWindow : NativeWindow
         $grpMode.Size = New-Object System.Drawing.Size(340, 60)
         $grpMode.ForeColor = $darkFore
 
-        $radRespect = New-Object System.Windows.Forms.RadioButton
-        $radRespect.Text = "Respect taskbar"
-        $radRespect.Location = New-Object System.Drawing.Point(15, 22)
-        $radRespect.Size = New-Object System.Drawing.Size(140, 20)
-        $radRespect.ForeColor = $darkFore
+        $script:radRespect = New-Object System.Windows.Forms.RadioButton
+        $script:radRespect.Text = "Respect taskbar"
+        $script:radRespect.Location = New-Object System.Drawing.Point(15, 22)
+        $script:radRespect.Size = New-Object System.Drawing.Size(140, 20)
+        $script:radRespect.ForeColor = $darkFore
+        $script:radRespect.Checked = ($script:pendingMode -eq "RespectTaskbar")
 
-        $radIgnore = New-Object System.Windows.Forms.RadioButton
-        $radIgnore.Text = "Ignore taskbar"
-        $radIgnore.Location = New-Object System.Drawing.Point(170, 22)
-        $radIgnore.Size = New-Object System.Drawing.Size(140, 20)
-        $radIgnore.ForeColor = $darkFore
+        $script:radIgnore = New-Object System.Windows.Forms.RadioButton
+        $script:radIgnore.Text = "Ignore taskbar"
+        $script:radIgnore.Location = New-Object System.Drawing.Point(170, 22)
+        $script:radIgnore.Size = New-Object System.Drawing.Size(140, 20)
+        $script:radIgnore.ForeColor = $darkFore
+        $script:radIgnore.Checked = ($script:pendingMode -eq "IgnoreTaskbar")
 
-        if ($script:config.CenteringMode -eq "RespectTaskbar") { $radRespect.Checked = $true } else { $radIgnore.Checked = $true }
+        $grpMode.Controls.AddRange(@($script:radRespect, $script:radIgnore))
 
-        $grpMode.Controls.AddRange(@($radRespect, $radIgnore))
-        $radRespect.Add_CheckedChanged({
-            if ($radRespect.Checked) { $script:config.CenteringMode = "RespectTaskbar"; Save-Config $script:config }
+        # Radio buttons update pending mode only (no immediate save)
+        $script:radRespect.Add_CheckedChanged({
+            if ($script:radRespect.Checked) { $script:pendingMode = "RespectTaskbar" }
         })
-        $radIgnore.Add_CheckedChanged({
-            if ($radIgnore.Checked) { $script:config.CenteringMode = "IgnoreTaskbar"; Save-Config $script:config }
+        $script:radIgnore.Add_CheckedChanged({
+            if ($script:radIgnore.Checked) { $script:pendingMode = "IgnoreTaskbar" }
         })
 
-        # Three horizontal action buttons
         $btnSave = New-Object System.Windows.Forms.Button
         $btnSave.Text = "Save"
         $btnSave.Location = New-Object System.Drawing.Point(12, 190)
@@ -507,10 +476,13 @@ public class MessageOnlyWindow : NativeWindow
         $btnSave.ForeColor = [System.Drawing.Color]::White
         $btnSave.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
         $btnSave.Add_Click({
+            # Apply pending hotkeys and mode to config
             if ($script:pendingHK1) { $script:config.Hotkey1 = $script:pendingHK1 } else { $script:config.Hotkey1 = $null }
             if ($script:pendingHK2) { $script:config.Hotkey2 = $script:pendingHK2 } else { $script:config.Hotkey2 = $null }
+            $script:config.CenteringMode = $script:pendingMode
             Save-Config $script:config
             Update-HotkeyRegistration
+            # Update pending copies to match saved config
             $script:pendingHK1 = Copy-HotkeyObject $script:config.Hotkey1
             $script:pendingHK2 = Copy-HotkeyObject $script:config.Hotkey2
         })
@@ -542,9 +514,6 @@ public class MessageOnlyWindow : NativeWindow
             $grpMode, $btnSave, $btnOpenConfig, $btnRestartAdmin
         ))
 
-        # KeyDown handlers stay inline (WinForms passes $sender,$e and inline
-        # scriptblocks close cleanly over $script: scope). They delegate the pure
-        # parse to Get-HotkeyFromKeyArgs so the two slots share one implementation.
         $script:txtHK1.Add_KeyDown({
             $e = $_
             if ($script:txtHK1.Text -eq "Press keys...") { $script:txtHK1.Text = "" }
@@ -575,34 +544,43 @@ public class MessageOnlyWindow : NativeWindow
             $e.SuppressKeyPress = $true
         })
 
-        # Fixed: allow the form to really close when the application exits
         $script:settingsForm.Add_FormClosing({
             if ($_.CloseReason -eq [System.Windows.Forms.CloseReason]::UserClosing) {
-                $changed = (HotkeysDiffer $script:pendingHK1 $script:config.Hotkey1) -or
-                           (HotkeysDiffer $script:pendingHK2 $script:config.Hotkey2)
-                if ($changed) {
+                $hkChanged = (HotkeysDiffer $script:pendingHK1 $script:config.Hotkey1) -or
+                             (HotkeysDiffer $script:pendingHK2 $script:config.Hotkey2)
+                $modeChanged = ($script:pendingMode -ne $script:config.CenteringMode)
+
+                if ($hkChanged -or $modeChanged) {
+                    $msg = if ($hkChanged -and $modeChanged) {
+                        "Do you want to save hotkey and centering mode changes?"
+                    } elseif ($hkChanged) {
+                        "Do you want to save hotkey changes?"
+                    } else {
+                        "Do you want to save centering mode change?"
+                    }
                     $result = [System.Windows.Forms.MessageBox]::Show(
-                        "Do you want to save hotkey changes?",
+                        $msg,
                         "Window Centering Tool",
                         [System.Windows.Forms.MessageBoxButtons]::YesNoCancel,
                         [System.Windows.Forms.MessageBoxIcon]::Question)
                     if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
                         if ($script:pendingHK1) { $script:config.Hotkey1 = $script:pendingHK1 } else { $script:config.Hotkey1 = $null }
                         if ($script:pendingHK2) { $script:config.Hotkey2 = $script:pendingHK2 } else { $script:config.Hotkey2 = $null }
+                        $script:config.CenteringMode = $script:pendingMode
                         Save-Config $script:config
                         Update-HotkeyRegistration
+                        # Update pending copies
+                        $script:pendingHK1 = Copy-HotkeyObject $script:config.Hotkey1
+                        $script:pendingHK2 = Copy-HotkeyObject $script:config.Hotkey2
                     }
                     if ($result -eq [System.Windows.Forms.DialogResult]::Cancel) {
                         $_.Cancel = $true
                         return
                     }
                 }
-                # Hide instead of closing (so the form stays alive for the next show)
                 $_.Cancel = $true
                 $script:settingsForm.Hide()
-                [WinAPI]::SetProcessWorkingSetSize((Get-Process -Id $pid).Handle, -1, -1) | Out-Null
             }
-            # For ApplicationExit or WindowsShutDown we do nothing -> form closes normally
         })
 
         $script:settingsForm.Show()
@@ -625,12 +603,9 @@ public class MessageOnlyWindow : NativeWindow
             return
         }
 
-        # Elevation succeeded: hand off to the new (elevated) instance and tear down.
         Stop-Application
     }
 
-    # Single teardown helper used by the Exit menu, Restart-AsAdmin, and reusable
-    # from catch{}. Replaces the previously-duplicated unregister/dispose/exit blocks.
     function Stop-Application {
         try { [WinAPI]::UnregisterHotKey($script:msgWindow.Handle, $script:hotkeyIds.Primary)   | Out-Null } catch {}
         try { [WinAPI]::UnregisterHotKey($script:msgWindow.Handle, $script:hotkeyIds.Secondary) | Out-Null } catch {}
