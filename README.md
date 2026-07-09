@@ -14,17 +14,7 @@ A lightweight utility batch file for Windows that lets you center the active win
 - **Open Config** button – view/edit `WindowCenteringTool.json` directly
 - **Restart as Administrator** – elevate the tool when needed (e.g., to center windows of elevated apps)
 - Config automatically saved (JSON)
-- Fully silent launch (no command prompt flashes)
 - Reduced memory footprint (periodic trimming)
-
-## Tested on
-
-- Windows 11 23H2
-- Windows 11 25H2
-
-## License
-
-MIT License
 
 ## Work in Progress
 
