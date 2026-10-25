@@ -1,36 +1,36 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
-set "POWERSHELL=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
-if not exist "%POWERSHELL%" (echo PowerShell not found.& pause & exit /b 1)
+
+REM =====================================================================
+REM  Window Centering Tool - launcher
+REM  Compatible with Windows 11 24H2 / 25H2 / 26H2 and later.
+REM =====================================================================
+
+REM VBScript (wscript.exe) is deprecated in Windows 11 and is scheduled to
+REM be disabled by default around 2027 and removed afterwards, so this
+REM launcher no longer creates or runs any .vbs file. It extracts the
+REM embedded PowerShell script (between the :PS_START and :PS_END markers)
+REM into a uniquely named temp file, then relaunches it in a hidden,
+REM console-free PowerShell process. The extracted script deletes its own
+REM temp file when it starts, so nothing is left behind in the temp folder.
+
+REM Prefer in-box Windows PowerShell 5.1; fall back to PowerShell 7.
+set "WCT_POWERSHELL=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+if not exist "%WCT_POWERSHELL%" set "WCT_POWERSHELL=%ProgramFiles%\PowerShell\7\pwsh.exe"
+if not exist "%WCT_POWERSHELL%" (
+    echo Windows PowerShell 5.1 or PowerShell 7 is required but was not found.
+    pause
+    exit /b 1
+)
+
 set "me=%~f0"
 set "CENTER_WINDOW_BATDIR=%~dp0"
 set "CENTER_WINDOW_BATFILE=%me%"
-
-REM Use unique temporary filenames to avoid collisions between multiple instances
-set "tempPs=%TEMP%\CenterWindowTray_%PID%.ps1"
-set "tempVbs=%TEMP%\CenterWindowTray_%PID%.vbs"
-
-REM Extract the embedded PowerShell script (between :PS_START and :PS_END)
-for /f "tokens=1 delims=:" %%N in ('findstr /n "^:PS_START" "%me%"') do set "startLine=%%N"
-for /f "tokens=1 delims=:" %%N in ('findstr /n "^:PS_END"   "%me%"') do set "endLine=%%N"
-set /a "startLine+=1"
-set /a "endLine-=1"
-"%POWERSHELL%" -NoProfile -Command "$lines = Get-Content '%me%'; $lines[(%startLine%-1)..(%endLine%-1)] | Set-Content '%tempPs%' -Encoding UTF8"
-
-REM Create a tiny VBScript that launches the PowerShell script hidden, then cleans up the .ps1
-(
-echo On Error Resume Next
-echo Set WshShell = CreateObject^("WScript.Shell"^)
-echo WshShell.Run """%POWERSHELL%"" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""%tempPs%""", 0, False
-echo WScript.Sleep 2000
-echo Set fso = CreateObject^("Scripting.FileSystemObject"^)
-echo fso.DeleteFile "%tempPs%", True
-) > "%tempVbs%"
-wscript.exe //nologo "%tempVbs%"
-
-REM The batch file's job is done – the tool runs in the background now
+"%WCT_POWERSHELL%" -NoProfile -ExecutionPolicy Bypass -Command "$bat = $env:CENTER_WINDOW_BATFILE; if (-not $bat) { Write-Host 'CENTER_WINDOW_BATFILE environment variable is missing.'; exit 1 }; $lines = [System.IO.File]::ReadAllLines($bat); $s = -1; $e = -1; for ($i = 0; $i -lt $lines.Count; $i++) { if ($lines[$i] -match '^:PS_START') { if ($s -lt 0) { $s = $i + 1 } } elseif ($lines[$i] -match '^:PS_END') { if ($e -lt 0) { $e = $i - 1 } } }; if ($s -lt 0 -or $e -lt 0 -or $e -lt $s) { Write-Host 'Could not find the :PS_START / :PS_END markers in this batch file.'; exit 1 }; $ps1 = Join-Path $env:TEMP ('WCT_' + $PID + '.ps1'); Set-Content -LiteralPath $ps1 -Value $lines[($s..$e)] -Encoding UTF8; $q = [char]34; $psi = New-Object System.Diagnostics.ProcessStartInfo; $psi.FileName = $env:WCT_POWERSHELL; $psi.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File ' + $q + $ps1 + $q; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; $psi.WorkingDirectory = $env:TEMP; [System.Diagnostics.Process]::Start($psi) | Out-Null"
+REM The batch file's job is done - the tool now runs in the background.
+REM Keep the console open if the launcher reported an error.
+if errorlevel 1 pause
 exit /b
-
 :PS_START
 #region Bootstrap & error trap
 $configDir = $env:CENTER_WINDOW_BATDIR
