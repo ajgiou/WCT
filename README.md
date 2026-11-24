@@ -65,4 +65,4 @@ A lightweight utility batch file for Windows that lets you center the active win
 
 ## Work in Progress
 
-It's still a work in progress, so expect some problems here and there.
+It's still a work in progress, so expect some problems.
