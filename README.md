@@ -30,7 +30,6 @@ A lightweight utility batch file for Windows that lets you center the active win
 
 - Windows 10 or Windows 11 (24H2 / 25H2 / 26H2 and later)
 - Windows PowerShell 5.1 (built into Windows). If 5.1 is ever missing, the launcher automatically falls back to PowerShell 7 (`pwsh.exe`) if it is installed.
-- No VBScript/wscript dependency and nothing to install
 
 ## How It Works
 
