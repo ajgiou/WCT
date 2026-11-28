@@ -1,6 +1,6 @@
 # Window Centering Tool (WCT)
 
-A lightweight utility batch file for Windows that lets you center the active window with a customizable hotkey. Runs silently in the system tray.
+A lightweight utility batch file for Windows that lets you center the active window with a customizable hotkey. Runs in the system tray.
 
 ## Features
 
